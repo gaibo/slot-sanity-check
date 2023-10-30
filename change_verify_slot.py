@@ -318,6 +318,7 @@ def get_internals_spreadsheet_fighter_codes(internals_spreadsheet: pd.DataFrame)
 
 def do_verification(mod_path: Path) -> bool:
     mod_slot = extract_slot_from_path(mod_path)     # Raises exception if can't
+    print(f"Mod slot C0{mod_slot} successfully found in mod name! Nice naming convention!")
     dirfile_success, configjson_success, params_success, spellcheck_success = [True]*4  # Initialize as passing
 
     # Search mod directory for slot-specific things:
@@ -344,12 +345,14 @@ def do_verification(mod_path: Path) -> bool:
             print(wrong.relative_to(mod_path))
     elif wrong_slot_files:
         dirfile_success = False
-        print("FAILURE: Wrong slot FILES found (uh, maybe false positives from custom victory screens)! "
-              "Please manually check/fix these:")
+        print("FAILURE: Wrong slot FILES found (uh, actually decent chance of false positives from custom victory "
+              "screens, custom victory music, etc.)! Please manually check/fix these:")
         for wrong in wrong_slot_files:
             print(wrong.relative_to(mod_path))
     else:
         print("SUCCESS: No wrong slot directories/files found! Moving on...")
+
+    print('\n', end='')     # Print newline between sections for aesthetics
 
     # 2a) Find config.json
     file_addition_config = list(mod_path.glob('config.json'))   # .glob() is good for constant name files
@@ -395,6 +398,8 @@ def do_verification(mod_path: Path) -> bool:
             print(f"SUCCESS: config.json seems to have configurations for C0{mod_slot}! Moving on...")
     else:
         print("No config.json (Arcropolis file addition configuration) found. Moving on...")
+
+    print('\n', end='')  # Print newline between sections for aesthetics
 
     # 3a) Find msg_name.msbt/.xmsbt and ui_chara_db.prc/.prcx/.prcxml
     # Despite being a param patch, .prcx is compiled so can't be easily read without external software
@@ -475,6 +480,8 @@ def do_verification(mod_path: Path) -> bool:
         if correct_slot_labels:
             print("\"Correct\" slot msg_name.xmsbt entry labels found:")
             print(correct_slot_labels)
+            print(f"SUCCESS: msg_name.xmsbt seems to have configurations for C0{mod_slot}'s 'n0{mod_slot}_index' "
+                  f"value '{index_value}'! Moving on...")
         else:
             params_success = False
             print(f"FAILURE: No correct slot msg_name.xmsbt entry labels found! We checked for 'n0{mod_slot}_index' "
@@ -482,13 +489,66 @@ def do_verification(mod_path: Path) -> bool:
     else:
         print("No verifiable msg_name (custom text) found. Moving on...")
 
+    print('\n', end='')  # Print newline between sections for aesthetics
+
     # Fancy - check spelling of fighter codes in
     # 1) fighter/ nested folders
-    # 2) individual files (delimiting by _ and .), check every word lmaooo gonna be very imprecise
-    # 3) inside config.json and maybe msg_name.xmsbt
-    pass
+    # 2) individual files (delimiting by _ and maybe . unless we remove suffix), check every word (lol)
+    # 3) inside config.json (delimit by /) and maybe msg_name.xmsbt (delimit by _)
+    # Make sets of words from each source, eliminate all words that are in knowledge bank,
+    # run the rest of the words through spellcheck, return source if there are any suggestion hits!
+    try:
+        internals_spreadsheet = load_internals_spreadsheet()
+        fighter_codes_set = set(get_internals_spreadsheet_fighter_codes(internals_spreadsheet))
+        print("'Smash Ultimate 13.0.1 Internal Numbers and Codes' spreadsheet found! "
+              "Commencing \"smart spellcheck\" (I had fun with this one, please bear with me):")
+
+        def spellcheck_words_dict(words_dict):
+            standard_false_positives = {'stream;', 'model', 'skin'}     # Triggers spellcheck to 'master', 'demon', etc.
+            for key_words_set, value_source in words_dict.items():
+                close_matches = []
+                for set_word in key_words_set:
+                    if set_word not in fighter_codes_set and set_word not in standard_false_positives:
+                        close_matches += fuzzy_matches(set_word, knowledge_bank=fighter_codes_set)
+                if close_matches:
+                    if isinstance(value_source, Path):
+                        value_source = value_source.relative_to(mod_path)
+                    print(f"- Spellcheck suggestions for '{value_source}': {close_matches}")
+
+        re_word_sep = re.compile(r'[_./]')
+        mod_dirs_words_dict = {frozenset(re_word_sep.split(d.stem)): d for d in mod_dirs}
+        mod_files_words_dict = {frozenset(re_word_sep.split(f.stem)): f for f in mod_files}
+        # Spellcheck dirs/files words dicts!
+        # NOTE: spellcheck meant to be aggressive; for now, I won't link it to the spellcheck_success flag
+        spellcheck_words_dict(mod_dirs_words_dict)
+        spellcheck_words_dict(mod_files_words_dict)
+        if file_addition_config:
+            config_json_words_dict = {}
+            for key_slot, value_filepathlist in slot_filepathlist_dict.items():
+                # Inspection doesn't warn that dict might be referenced before assignment... weird but I'll take it
+                config_json_words_dict[frozenset(re_word_sep.split(key_slot))] = "config.json slot: " + key_slot
+                for filepath in value_filepathlist:
+                    config_json_words_dict[frozenset(re_word_sep.split(filepath))] = "config.json filepath: " + filepath
+            # Spellcheck config_json_words_dict!
+            spellcheck_words_dict(config_json_words_dict)
+        if readable_param_patch_msg_name:
+            msg_name_words_dict = {}
+            for entry_label in entry_labels:
+                # Inspection shows warning that entry_labels might be referenced before assignment, but impossible
+                msg_name_words_dict[frozenset(re_word_sep.split(entry_label))] = "msg_name entry label: " + entry_label
+            # Spellcheck msg_name_words_dict!
+            spellcheck_words_dict(msg_name_words_dict)
+        print("Spellcheck complete. Experimental, so no success/failure message. Moving on...")
+    except FileNotFoundError as no_internals_spreadsheet_msg:
+        print(f"{no_internals_spreadsheet_msg}. Skipping smart spellcheck...\n"
+              f"Seriously though you should go get that spreadsheet... Moving on...")
+
+    print('\n', end='')  # Print newline between sections for aesthetics
 
     success = all((dirfile_success, configjson_success, params_success, spellcheck_success))
+    print(f"\nVERIFICATION COMPLETE! TRUE MEANS ALL CLEAR, FALSE MEANS PROBABLY NOT; "
+          f"SEE PRINTED STATEMENTS ABOVE FOR DETAILS AND GUIDANCE:\n"
+          f"{success}")
     return success
 
 
