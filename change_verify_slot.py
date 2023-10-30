@@ -5,6 +5,8 @@ from collections import Counter
 from typing import Set, List, Callable, Tuple
 import pandas as pd
 import openpyxl
+import json
+import xml.etree.ElementTree as ET
 
 """
 This script aims to speed up folder/file renaming necessary to change the
@@ -145,6 +147,7 @@ def collect_dirlist_filelist(root_path: Path | str) -> Tuple[List[Path], List[Pa
     """ Return list of all nested directories and list of all files after walking it
         NOTE: I originally wrote this in Python 3.10, when pathlib didn't have Path.walk() built-in;
               this is extremely annoying, but I am importing os exclusively to use os.walk()
+        NOTE: no "duplicate" names in output because full paths are used; List rather than Set to preserve walk order
     :param root_path: Path to directory
     :return: (list of dirs, list of files)
     """
@@ -159,6 +162,32 @@ def collect_dirlist_filelist(root_path: Path | str) -> Tuple[List[Path], List[Pa
         if files:
             filelist += [Path(root)/file_i for file_i in files]
     return dirlist, filelist
+
+
+def flatten_dict(nested_dict: dict, separator: str | None = '_', parent: str = '') -> dict:
+    """ Flatten nested dictionary to single level of keys and values; unless separator is set to None,
+        keys are casted to strings for now (I can imagine expanding to allow types with + operator
+        overloading, and casting to string if it's a mix, but that seems more trouble than it's worth);
+        separator is used to concatenate nested keys, keeping them unique when flattened
+    :param nested_dict: Python dictionary
+    :param separator: string used to concatenate parent key with nested key; set None to allow
+                      overwriting values (keeping the most nested) rather than generating new keys!
+    :param parent: used to pass parent key state during recursion; set '' to initialize at root
+    :return: flattened dict
+    """
+    flattened_dict = {}
+    for key, value in nested_dict.items():
+        if separator is None:
+            full_path_str_key = key     # Don't generate new unique key
+        else:
+            full_path_str_key = parent + separator + str(key) if parent else str(key)   # No separator if root
+        if isinstance(value, dict):
+            # Recurse
+            flattened_value_dict = flatten_dict(value, separator=separator, parent=full_path_str_key)
+            flattened_dict |= flattened_value_dict
+        else:
+            flattened_dict[full_path_str_key] = value
+    return flattened_dict
 
 
 def pretty_print_dir(root_path: Path | str) -> None:
@@ -289,32 +318,178 @@ def get_internals_spreadsheet_fighter_codes(internals_spreadsheet: pd.DataFrame)
 
 def do_verification(mod_path: Path) -> bool:
     mod_slot = extract_slot_from_path(mod_path)     # Raises exception if can't
+    dirfile_success, configjson_success, params_success, spellcheck_success = [True]*4  # Initialize as passing
+
     # Search mod directory for slot-specific things:
-    # 1) Directories/files with slot number in name - VERIFY if any slot numbers don't match actual slot
-    mod_dirs, mod_files = collect_dirlist_filelist(mod_path)
-    re_slot_filter = re.compile(r'(?<!\d)0[0-7](?!\d)')  # .glob() can't weed out '_001.nutexb'; need regex filter!
+    # 1a) Find directories/files with slot number in name
+    mod_dirs, mod_files = collect_dirlist_filelist(mod_path)    # Kind of brute force pre-walk
+    re_slot_filter = re.compile(r'(?<!\d)0[0-7](?!\d)')  # .glob() can't weed out '_001.nutexb'; need this regex!
     slot_specific_dirs = [d for d in mod_dirs if re_slot_filter.search(d.name) is not None]
     slot_specific_files = [f for f in mod_files if re_slot_filter.search(f.name) is not None]
-    # config.json - check slot-related text
-    file_addition_config = list(mod_path.glob('config.json'))
-    # msg_name.msbt/.xmsbt and ui_chara_db.prc/.prcx/.prcxml - check .xmsbt
-    immutable_params = list(mod_path.glob('**/msg_name.msbt')) + list(mod_path.glob('**/ui_chara_db.prc'))
-    mutable_param_patches = list(mod_path.glob('**/msg_name.xmsbt')) + list(mod_path.glob('**/ui_chara_db.prcx*'))
+    # 1b) VERIFY if any slot numbers don't match actual slot
+    if mod_slot == 0:
+        re_not_mod_slot_digit_helper = r'[1-7]'
+    elif mod_slot == 7:
+        re_not_mod_slot_digit_helper = r'[0-6]'
+    else:
+        # Want to avoid given digit; I can't think of a good way to do this with [^{mod_slot}] or \d
+        re_not_mod_slot_digit_helper = fr'(?:[0-{mod_slot-1}]|[{mod_slot+1}-7])'
+    re_not_mod_slot_filter = re.compile(fr'(?<!\d)0{re_not_mod_slot_digit_helper}(?!\d)')
+    wrong_slot_dirs = [d for d in slot_specific_dirs if re_not_mod_slot_filter.search(d.name) is not None]
+    wrong_slot_files = [f for f in slot_specific_files if re_not_mod_slot_filter.search(f.name) is not None]
+    if wrong_slot_dirs:
+        dirfile_success = False
+        print("FAILURE: Wrong slot DIRECTORIES found! Please manually check/fix these:")
+        for wrong in wrong_slot_dirs:
+            print(wrong.relative_to(mod_path))
+    elif wrong_slot_files:
+        dirfile_success = False
+        print("FAILURE: Wrong slot FILES found (uh, maybe false positives from custom victory screens)! "
+              "Please manually check/fix these:")
+        for wrong in wrong_slot_files:
+            print(wrong.relative_to(mod_path))
+    else:
+        print("SUCCESS: No wrong slot directories/files found! Moving on...")
+
+    # 2a) Find config.json
+    file_addition_config = list(mod_path.glob('config.json'))   # .glob() is good for constant name files
+    # 2b) VERIFY slot-related text - fine to have extra slots/files configured, but must have actual slot
+    re_mod_slot_filter = re.compile(fr'(?<!\d)0{mod_slot}(?!\d)')
+    if file_addition_config:
+        print(f"config.json (Arcropolis file addition configuration) found! "
+              f"Should be fine to have extra/unused configurations, but checking actual slot "
+              f"(C0{mod_slot}) is configured...")
+        with open(file_addition_config[0], 'r') as config_json:
+            config_json_data = json.load(config_json)
+            # config.json has universal pattern of
+            # 'new-dir-files':
+            #     'fighter/<fighter_code>/c0X':
+            #         [list of relative paths to files which should be detected by above slot]
+            slot_filepathlist_dict = config_json_data['new-dir-files']  # Un-nest from new-dir-files
+            correct_slot_names = [slot_name for slot_name in slot_filepathlist_dict.keys()
+                                  if re_mod_slot_filter.search(slot_name) is not None]
+            if correct_slot_names:
+                if len(correct_slot_names) > 1:
+                    print(f"WARNING: {len(correct_slot_names)} config.json slot names "
+                          f"with mod slot C0{mod_slot} found! Maybe different characters (Kirby cap?)? "
+                          f"It's unusual for a mod to have this, so alerting just in case.")
+                for correct_slot_name in correct_slot_names:
+                    # Realistically this loop will only execute once, unless for example both Pikachu and
+                    # Cloud have C07 edits (i.e. both have their added files listed in same config.json somehow)
+                    added_files_list = slot_filepathlist_dict[correct_slot_name]
+                    for added_file in added_files_list:
+                        if (re_mod_slot_filter.search(added_file) is None
+                                or re_not_mod_slot_filter.search(added_file) is not None):
+                            # Complex condition: looking for suspicious cases of either
+                            # 1) correct slot labeled file not there or 2) wrong slot labeled file is there;
+                            # Note this is labeled "warning" and not "failure" because many characters have different
+                            # textures on different slots, and for a mod to be moveable in that case, default (non-
+                            # slot-labeled) texture files could be reused and declared for other slots in config.json!
+                            print(f"WARNING: '{correct_slot_name}': '{added_file}' doesn't seem to be "
+                                  f"specific to C0{mod_slot}; not necessarily wrong, alerting just in case")
+            else:
+                configjson_success = False
+                print(f"FAILURE: config.json - no C0{mod_slot} slot key designated to receive additional files. "
+                      f"That's the whole purpose of config.json.")
+        if configjson_success:
+            print(f"SUCCESS: config.json seems to have configurations for C0{mod_slot}! Moving on...")
+    else:
+        print("No config.json (Arcropolis file addition configuration) found. Moving on...")
+
+    # 3a) Find msg_name.msbt/.xmsbt and ui_chara_db.prc/.prcx/.prcxml
+    # Despite being a param patch, .prcx is compiled so can't be easily read without external software
+    unreadable_params_msg_name = list(mod_path.glob('**/msg_name.msbt'))
+    unreadable_params_ui_chara_db = (list(mod_path.glob('**/ui_chara_db.prc'))
+                                     + list(mod_path.glob('**/ui_chara_db.prcx')))
+    readable_param_patch_msg_name = list(mod_path.glob('**/msg_name.xmsbt'))
+    readable_param_patch_ui_chara_db = list(mod_path.glob('**/ui_chara_db.prcxml'))  # More rarely used
+    # 3b) VERIFY .xmsbt slot "index values", which may not necessarily be slot numbers but generally are
+    # Note: I believe no reason to "verify" ui_chara_db if there's no readable msg_name - a mod like Giga Bowser
+    #       Character Expansion will edit it to unlock the character, but there's no pattern to follow;
+    #       we check ui_chara_db in conjunction with msg_name though because "index values" must match
+    if unreadable_params_msg_name:
+        print("WARNING: msg_name.msbt (modified overwrite of default text names) found, but we can't read/verify it!")
+    if readable_param_patch_msg_name:
+        print("msg_name.xmsbt (Arcropolis msg_name.msbt param patch) found! Likely for purpose of single-slot text.")
+        if unreadable_params_ui_chara_db:
+            print("WARNING: ui_chara_db exists but not in readable .prcxml format; we can't read/verify it!")
+        elif readable_param_patch_ui_chara_db:
+            print(f"ui_chara_db.prcxml (Arcropolis ui_chara_db.prc param patch) found! This means we can verify "
+                  f"msg_name.xmsbt contents with certainty by checking 'n0{mod_slot}_index' value!")
+        else:
+            print("WARNING: no ui_chara_db found, despite modified msg_name! Might be intentional to overwrite "
+                  "character's every slot's text; not necessarily wrong, alerting just in case.")
+        # I should consider using xmltodict library, which makes XML feel like JSON, for consistency
+        # msg_name has pattern of
+        # <xmsbt>
+        #     <entry label="nam_chr0_<index_value>_<fighter_code>">
+        #         <text>Fighter Unlock Screen name</text>
+        #     </entry>
+        #     <entry label="nam_chr1_<index_value>_<fighter_code>">
+        #         <text>CSS portrait name</text>
+        #     </entry>
+        #     <entry label="nam_chr2_<index_value>_<fighter_code>">
+        #         <text>VS. AND RESULTS SCREEN NAME</text>
+        #     </entry>
+        #     <entry label="nam_chr3_<index_value>_<fighter_code>">
+        #         <text>CSS ICON NAME (FOR SLOT 0)</text>
+        #     </entry>
+        #     <entry label="nam_stage_name_<index_value>_<fighter_code>">
+        #         <text>Boxing Ring Hype Name</text>
+        #     </entry>
+        # ...
+        msg_name_tree = ET.parse(readable_param_patch_msg_name[0])
+        xmsbt_root = msg_name_tree.getroot()     # <xmsbt> opening tag; can now iterate through <entry> tags
+        entry_labels = [entry.attrib['label'] for entry in xmsbt_root]     # Crucial label names (not text itself)
+        if readable_param_patch_ui_chara_db:
+            # Read ui_chara_db.prcxml for n0X_index (where X is slot) edits; pattern of
+            # <struct>
+            #     <list hash="db_root">
+            #         <struct index="<0-121 slot number>">
+            #             <byte hash="n01_index">1</byte>
+            # ...
+            ui_chara_db_tree = ET.parse(readable_param_patch_ui_chara_db[0])
+            struct_root = ui_chara_db_tree.getroot()  # <struct> opening tag
+            mod_slot_index_value_edit = struct_root.findall(fr"./list/struct/byte[@hash='n0{mod_slot}_index']")
+            if mod_slot_index_value_edit:
+                index_value = int(mod_slot_index_value_edit[0].text)    # e.g. cast '1' to 1
+            else:
+                print(f"WARNING: no 'n0{mod_slot}_index' value edit found in ui_chara_db.prcxml. "
+                      f"Assuming intentional use of default index value '0'.")
+                index_value = 0     # Smash Ultimate's default index value is technically 0 (for all slots)
+        else:
+            index_value = mod_slot  # No ui_chara_db, we'll just assume to check mod_slot
+        # Check that there exist labels for either 1) n0X_index value if ui_chara_db.prcxml was found and read
+        # or 2) slot number if we couldn't access ui_chara_db (in general, n0X_index value is edited to X)
+        re_index_value_filter = re.compile(fr'(?<!\d)0{index_value}(?!\d)')
+        correct_slot_labels = []
+        wrong_slot_labels = []
+        for entry_label in entry_labels:
+            if re_index_value_filter.search(entry_label) is None:
+                wrong_slot_labels.append(entry_label)
+            else:
+                correct_slot_labels.append(entry_label)
+        if wrong_slot_labels:
+            print("WARNING: \"Wrong\" slot msg_name.xmsbt entry labels found! Please manually check/fix these:")
+            print(wrong_slot_labels)
+        if correct_slot_labels:
+            print("\"Correct\" slot msg_name.xmsbt entry labels found:")
+            print(correct_slot_labels)
+        else:
+            params_success = False
+            print(f"FAILURE: No correct slot msg_name.xmsbt entry labels found! We checked for 'n0{mod_slot}_index' "
+                  f"value '{index_value}', e.g. <entry label=\"nam_chr1_0{index_value}_<fighter_code>\">, etc.")
+    else:
+        print("No verifiable msg_name (custom text) found. Moving on...")
 
     # Fancy - check spelling of fighter codes in
     # 1) fighter/ nested folders
     # 2) individual files (delimiting by _ and .), check every word lmaooo gonna be very imprecise
     # 3) inside config.json and maybe msg_name.xmsbt
+    pass
 
-    sorted([fuzzy_slot_specific.parts[-1] for fuzzy_slot_specific in mod_path.glob(f'**/*0{mod_slot}*')])
-    list(mod_path.glob(f'**/*0{mod_slot}*'))[0].relative_to(mod_path)     # Get that human-readable relative path!
-    re.sub(r'(?<!\d)0[0-7](?!\d)', fr'0{new_slot}', glob)   # For renaming 03.bntx or even 03 but not 003
-    # And we could brute force and search for other stuff cycling through the other slots lmao
-    # Alternatively, we actually look for each folder in our "known" list
-    # Print (aesthetically) the discovered list
-    # Verify that source slot number is in each; print otherwise
-    # Should be able to pipe to debug: result should raise error or None on failing to detect slot (can't even start),
-    # otherwise return True for no issues, False for issues, either way print messages (we can redirect prints)
+    success = all((dirfile_success, configjson_success, params_success, spellcheck_success))
+    return success
 
 
 def do_batch_verification(mod_path: Path | str) -> None:
@@ -325,6 +500,9 @@ def do_batch_verification(mod_path: Path | str) -> None:
 
 def do_renaming(mod_root_path, mod_slot_int, new_slot_int):
     fuzzy_slot_specific = mod_path.glob(f'**/*0{mod_slot}*')  # Might latch onto _001.nutexb, which we don't want
+    sorted([fuzzy_slot_specific.parts[-1] for fuzzy_slot_specific in mod_path.glob(f'**/*0{mod_slot}*')])
+    list(mod_path.glob(f'**/*0{mod_slot}*'))[0].relative_to(mod_path)  # Get that human-readable relative path!
+    re.sub(r'(?<!\d)0[0-7](?!\d)', fr'0{new_slot}', glob)  # For renaming 03.bntx or even 03 but not 003
     pass
 
 
