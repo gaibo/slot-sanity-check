@@ -7,6 +7,7 @@ import pandas as pd
 import openpyxl
 import json
 import xml.etree.ElementTree as ET
+import sys
 
 """
 This script aims to speed up folder/file renaming necessary to change the
@@ -316,8 +317,13 @@ def get_internals_spreadsheet_fighter_codes(internals_spreadsheet: pd.DataFrame)
     return known_fighter_codes_list
 
 
-def do_verification(mod_path: Path) -> bool:
-    mod_slot = extract_slot_from_path(mod_path)     # Raises exception if can't
+def do_verification(mod_path: Path | str) -> bool:
+    if not isinstance(mod_path, Path):
+        mod_path = Path(mod_path)
+    if not mod_path.is_dir():
+        raise ValueError(f"'{mod_path.name}': can't verify a non-directory")
+    print(f"---- '{mod_path.name}' ----")
+    mod_slot = extract_slot_from_path(mod_path)     # Raises ValueError if can't
     print(f"Mod slot C0{mod_slot} successfully found in mod name! Nice naming convention!")
     dirfile_success, configjson_success, params_success, spellcheck_success = [True]*4  # Initialize as passing
 
@@ -466,7 +472,8 @@ def do_verification(mod_path: Path) -> bool:
             index_value = mod_slot  # No ui_chara_db, we'll just assume to check mod_slot
         # Check that there exist labels for either 1) n0X_index value if ui_chara_db.prcxml was found and read
         # or 2) slot number if we couldn't access ui_chara_db (in general, n0X_index value is edited to X)
-        re_index_value_filter = re.compile(fr'(?<!\d)0{index_value}(?!\d)')
+        # Note the below regex zero-pads index_value - different because index_value can be 0-127, not just 0-7!
+        re_index_value_filter = re.compile(fr'(?<!\d){index_value:02}(?!\d)')   # index_value can be 0 or 13 or 105
         correct_slot_labels = []
         wrong_slot_labels = []
         for entry_label in entry_labels:
@@ -485,7 +492,7 @@ def do_verification(mod_path: Path) -> bool:
         else:
             params_success = False
             print(f"FAILURE: No correct slot msg_name.xmsbt entry labels found! We checked for 'n0{mod_slot}_index' "
-                  f"value '{index_value}', e.g. <entry label=\"nam_chr1_0{index_value}_<fighter_code>\">, etc.")
+                  f"value '{index_value}', e.g. <entry label=\"nam_chr1_{index_value:02}_<fighter_code>\">, etc.")
     else:
         print("No verifiable msg_name (custom text) found. Moving on...")
 
@@ -504,7 +511,8 @@ def do_verification(mod_path: Path) -> bool:
               "Commencing \"smart spellcheck\" (I had fun with this one, please bear with me):")
 
         def spellcheck_words_dict(words_dict):
-            standard_false_positives = {'stream;', 'model', 'skin'}     # Triggers spellcheck to 'master', 'demon', etc.
+            # The following words unintentionally trigger spellcheck to 'master', 'demon', 'elight', etc.
+            standard_false_positives = {'stream;', 'model', 'skin', 'light', 'normal'}
             for key_words_set, value_source in words_dict.items():
                 close_matches = []
                 for set_word in key_words_set:
@@ -513,7 +521,7 @@ def do_verification(mod_path: Path) -> bool:
                 if close_matches:
                     if isinstance(value_source, Path):
                         value_source = value_source.relative_to(mod_path)
-                    print(f"- Spellcheck suggestions for '{value_source}': {close_matches}")
+                    print(f"- Suggestions for '{value_source}': {close_matches}")
 
         re_word_sep = re.compile(r'[_./]')
         mod_dirs_words_dict = {frozenset(re_word_sep.split(d.stem)): d for d in mod_dirs}
@@ -552,10 +560,21 @@ def do_verification(mod_path: Path) -> bool:
     return success
 
 
-def do_batch_verification(mod_path: Path | str) -> None:
+def do_batch_verification(mod_path: Path | str) -> bool:
+    if not isinstance(mod_path, Path):
+        mod_path = Path(mod_path)
+    if not mod_path.is_dir():
+        raise ValueError(f"'{mod_path.name}': can't batch-verify a non-directory")
     batch_target_subdirs = [sub for sub in mod_path.iterdir() if sub.is_dir()]
-    for subdir in batch_target_subdirs:
-        do_verification(subdir)
+    subdir_results_list = []
+    for number, subdir in enumerate(batch_target_subdirs, start=1):
+        print(f"\n---------- {number} {''.join(['---------- ']*6)}\n")  # Print an aesthetic dividing line
+        try:
+            subdir_result = do_verification(subdir)
+            subdir_results_list.append(subdir_result)
+        except ValueError:
+            print(f"Skipping {subdir.name} (directory name doesn't look like single-slot mod)...")
+    return all(subdir_results_list)
 
 
 def do_renaming(mod_root_path, mod_slot_int, new_slot_int):
