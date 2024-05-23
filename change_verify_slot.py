@@ -1,13 +1,12 @@
 from pathlib import Path, PurePath
-import os
 import re
-from collections import Counter
-from typing import Set, List, Callable, Tuple
+from typing import List
 import pandas as pd
-import openpyxl
 import json
 import xml.etree.ElementTree as ET
 import sys
+from utils import collect_dirlist_filelist, xml_dfs_get_text_set
+from fuzzy_match import fuzzy_matches
 
 
 def extract_slot_from_path(mod_path: PurePath | str) -> int:
@@ -48,160 +47,18 @@ def replace_slot_into_path(mod_path: Path | str, new_slot: int | str) -> Path:
         return mod_path.with_name(new_name)
 
 
-def collect_dirlist_filelist(root_path: Path | str) -> Tuple[List[Path], List[Path]]:
-    """ Return list of all nested directories and list of all files after walking it
-        NOTE: I originally wrote this in Python 3.10, when pathlib didn't have Path.walk() built-in;
-              this is extremely annoying, but I am importing os exclusively to use os.walk()
-        NOTE: no "duplicate" names in output because full paths are used; List rather than Set to preserve walk order
-    :param root_path: Path to directory
-    :return: (list of dirs, list of files)
-    """
-    if not isinstance(root_path, Path):
-        root_path = Path(root_path)
-    if not root_path.is_dir():
-        raise ValueError(f"'{root_path.name}': shouldn't be walking a non-directory")
-    dirlist, filelist = [], []
-    for root, dirs, files in os.walk(root_path):
-        if dirs:
-            dirlist += [Path(root)/dir_i for dir_i in dirs]
-        if files:
-            filelist += [Path(root)/file_i for file_i in files]
-    return dirlist, filelist
-
-
-def flatten_dict(nested_dict: dict, separator: str | None = '_', parent: str = '') -> dict:
-    """ Flatten nested dictionary to single level of keys and values; unless separator is set to None,
-        keys are casted to strings for now (I can imagine expanding to allow types with + operator
-        overloading, and casting to string if it's a mix, but that seems more trouble than it's worth);
-        separator is used to concatenate nested keys, keeping them unique when flattened
-    :param nested_dict: Python dictionary
-    :param separator: string used to concatenate parent key with nested key; set None to allow
-                      overwriting values (keeping the most nested) rather than generating new keys!
-    :param parent: used to pass parent key state during recursion; set '' to initialize at root
-    :return: flattened dict
-    """
-    flattened_dict = {}
-    for key, value in nested_dict.items():
-        if separator is None:
-            full_path_str_key = key     # Don't generate new unique key
-        else:
-            full_path_str_key = parent + separator + str(key) if parent else str(key)   # No separator if root
-        if isinstance(value, dict):
-            # Recurse
-            flattened_value_dict = flatten_dict(value, separator=separator, parent=full_path_str_key)
-            flattened_dict |= flattened_value_dict
-        else:
-            flattened_dict[full_path_str_key] = value
-    return flattened_dict
-
-
-def pretty_print_dir(root_path: Path | str) -> None:
-    """ Aesthetically print file structure, i.e. recursively show names of sub-directories and files;
-        sort order is alphabetical directories first, then alphabetical files starting with extension
-        NOTE: I structure this function as an initialization wrapper + recursive function instead of
-              just the recursive function with default base case because each node needs to show whether
-              it's the "last child", which is an inelegant bit of state to pass recursively. Instead, I
-              print the edge case (root node) in this initial wrapper, then have recursive function
-              "look ahead" and print only the children of each node.
-    :param root_path: directory/path-like
-    :return: None
-    """
-    if not isinstance(root_path, Path):
-        root_path = Path(root_path)
-    if not root_path.is_dir():
-        raise ValueError(f"'{root_path.name}': can't pretty-print a non-directory")
-    print(root_path.name)   # Unique starting case that won't be covered during recursion
-    _pretty_print_dir_recurse(root_path, level=1)    # Note how level 1 indicates children of root
-
-
-def _pretty_print_dir_recurse(dir_path: Path, level: int) -> None:
-    """ Helper: recursively print children of directories; assumes node is directory whose name was already printed
-    :param dir_path: Path to directory
-    :param level: how deep into subdirectories we are
-    :return: None
-    """
-    if not dir_path.is_dir():
-        raise ValueError(f"'{dir_path.name}': shouldn't be recursively printing a non-directory")
-    # Sort children by alphabetical directories first, then alphabetical files starting with extension!
-    # NOTE: I'm being very explicit here because technically .iterdir()'s output order is undefined
-    sorted_children = sorted(dir_path.iterdir(), key=lambda p: ' '+p.name if p.suffix == '' else p.suffix+p.name)
-    for i, child in enumerate(sorted_children):
-        if i+1 == len(sorted_children):
-            # Dirty way to indicate last element
-            pretty_print = _pretty_print_last_child
-        else:
-            pretty_print = _pretty_print_non_last_child
-        pretty_print(child, level)
-        if child.is_dir():
-            _pretty_print_dir_recurse(child, level=level+1)
-
-
-def _pretty_print_non_last_child(general_path: PurePath, level: int) -> None:
-    """ Helper: aesthetically print a Path name with certain number of indentations
-    :param general_path: Path
-    :param level: how deep into subdirectories we are
-    :return: None
-    """
-    print(' '*4*(level-1), end='')
-    print('|-- ', end='')
-    print(general_path.name, end='\n')
-
-
-def _pretty_print_last_child(general_path: PurePath, level: int) -> None:
-    """ Helper: aesthetically print a Path name with certain number of indentations
-    :param general_path: Path
-    :param level: how deep into subdirectories we are
-    :return: None
-    """
-    print(' '*4*(level-1), end='')
-    print('L__ ', end='')
-    print(general_path.name, end='\n')
-
-
-def fuzzy_match_heuristic(element_1: str, element_2: str) -> float:
-    """ Simple heuristic to compare similarity of two strings - [0: no matching letters, 1: anagram]
-    :param element_1: string 1
-    :param element_2: string 2
-    :return: float in range [0, 1]
-    """
-    if len(element_1) > len(element_2):
-        long, short = element_1, element_2
-    else:
-        short, long = element_1, element_2
-    counter_long, counter_short = Counter(long), Counter(short)
-    acc = 0     # Tally total number of common letters
-    for char in counter_short.keys():
-        acc += min(counter_long.get(char, 0), counter_short[char])  # min is what they have in commmon
-    return acc / len(long)  # Heuristic
-
-
-def fuzzy_matches(element: str, knowledge_bank: Set[str], threshold: float = 0.75,
-                  heuristic: Callable[[str, str], float] = fuzzy_match_heuristic) -> List[str]:
-    """ Return sorted list of known things with highest fuzzy match heuristic to element (past threshold)
-    :param element: new thing to match
-    :param knowledge_bank: known things to match to
-    :param threshold: heuristic numerical threshold [0, 1] to register as a "match"
-    :param heuristic: heuristic function whose value is compared to threshold
-    :return: (ordered) list of known things
-    """
-    match_dict = {knowledge: heuristic(element, knowledge)
-                  for knowledge in knowledge_bank if heuristic(element, knowledge) >= threshold}
-    sorted_matches = sorted(match_dict.items(), key=lambda kv: kv[1], reverse=True)
-    return list(map(lambda kv: kv[0], sorted_matches))
-
-
 def load_internals_spreadsheet(location_path: Path | str = '.') -> pd.DataFrame:
-    """ Try to find and load latest "Smash Ultimate 13.0.1 Internal Numbers and Codes" spreadsheet
+    """ Try to find and load latest "Smash Ultimate Internal Numbers and Codes" spreadsheet
         NOTE: raises FileNotFoundError if spreadsheet is not found
     :param location_path: directory/path-like; by default searches the directory this script is currently in
     :return: pd.DataFrame of the spreadsheet
     """
     if not isinstance(location_path, Path):
         location_path = Path(location_path)
-    search_for_file = sorted(location_path.glob("Smash Ultimate 13.0.1 Internal Numbers and Codes*.xlsx"),
+    search_for_file = sorted(location_path.glob("Smash Ultimate*Internal Numbers and Codes*.xlsx"),
                              reverse=True)  # Version-agnostic, but prefer latest!
     if len(search_for_file) == 0:
-        raise FileNotFoundError(f"'Smash Ultimate 13.0.1 Internal Numbers and Codes' spreadsheet not found "
+        raise FileNotFoundError(f"'Smash Ultimate Internal Numbers and Codes' spreadsheet not found "
                                 f"at location '{str(location_path.absolute())}'")
     else:
         latest_found_file = search_for_file[0]
@@ -266,11 +123,11 @@ def do_verification(mod_path: Path | str) -> bool:
 
     # 2a) Find config.json
     file_addition_config = list(mod_path.glob('config.json'))   # .glob() is good for constant name files
-    # 2b) VERIFY slot-related text - fine to have extra slots/files configured, but must have actual slot
+    # 2b) VERIFY slot-related text - fine to have extra slots/files configured, but must include intended slot
     re_mod_slot_filter = re.compile(fr'(?<!\d)0{mod_slot}(?!\d)')
     if file_addition_config:
         print(f"config.json (Arcropolis file addition configuration) found! "
-              f"Should be fine to have extra/unused configurations, but checking actual slot "
+              f"Should be fine to have extra/unused configurations, but checking intended slot "
               f"(C0{mod_slot}) is configured...")
         with open(file_addition_config[0], 'r') as config_json:
             config_json_data = json.load(config_json)
@@ -327,7 +184,7 @@ def do_verification(mod_path: Path | str) -> bool:
     if readable_param_patch_msg_name:
         print("msg_name.xmsbt (Arcropolis msg_name.msbt param patch) found! Likely for purpose of single-slot text.")
         if unreadable_params_ui_chara_db:
-            print("WARNING: ui_chara_db exists but not in readable .prcxml format; we can't read/verify it!")
+            print("WARNING: ui_chara_db mod found but not in readable .prcxml format; we can't read/verify it!")
         elif readable_param_patch_ui_chara_db:
             print(f"ui_chara_db.prcxml (Arcropolis ui_chara_db.prc param patch) found! This means we can verify "
                   f"msg_name.xmsbt contents with certainty by checking 'n0{mod_slot}_index' value!")
@@ -375,7 +232,7 @@ def do_verification(mod_path: Path | str) -> bool:
         else:
             index_value = mod_slot  # No ui_chara_db, we'll just assume to check mod_slot
         # Check that there exist labels for either 1) n0X_index value if ui_chara_db.prcxml was found and read
-        # or 2) slot number if we couldn't access ui_chara_db (in general, n0X_index value is edited to X)
+        # or 2) slot number if we couldn't access ui_chara_db (in general, n0X_index's value is edited to X)
         # Note the below regex zero-pads index_value - different because index_value can be 0-127, not just 0-7!
         re_index_value_filter = re.compile(fr'(?<!\d){index_value:02}(?!\d)')   # index_value can be 0 or 13 or 105
         correct_slot_labels = []
@@ -411,12 +268,12 @@ def do_verification(mod_path: Path | str) -> bool:
     try:
         internals_spreadsheet = load_internals_spreadsheet()
         fighter_codes_set = set(get_internals_spreadsheet_fighter_codes(internals_spreadsheet))
-        print("'Smash Ultimate 13.0.1 Internal Numbers and Codes' spreadsheet found! "
+        print("'Smash Ultimate Internal Numbers and Codes' spreadsheet found! "
               "Commencing \"smart spellcheck\" (I had fun with this one, please bear with me):")
 
         def spellcheck_words_dict(words_dict):
             # The following words unintentionally trigger spellcheck to 'master', 'demon', 'elight', etc.
-            standard_false_positives = {'stream;', 'model', 'skin', 'light', 'normal'}
+            standard_false_positives = {'stream;', 'model', 'skin', 'light', 'normal', 'wariob'}
             for key_words_set, value_source in words_dict.items():
                 close_matches = []
                 for set_word in key_words_set:
@@ -450,6 +307,13 @@ def do_verification(mod_path: Path | str) -> bool:
                 msg_name_words_dict[frozenset(re_word_sep.split(entry_label))] = "msg_name entry label: " + entry_label
             # Spellcheck msg_name_words_dict!
             spellcheck_words_dict(msg_name_words_dict)
+        if readable_param_patch_ui_chara_db:
+            ui_chara_db_words_dict = {}
+            text_set = xml_dfs_get_text_set(struct_root)
+            for text in text_set:
+                ui_chara_db_words_dict[frozenset(re_word_sep.split(text))] = "ui_chara_db text: " + text
+            # Spellcheck ui_chara_db_words_dict!
+            spellcheck_words_dict(ui_chara_db_words_dict)
         print("Spellcheck complete. Experimental, so no success/failure message. Moving on...")
     except FileNotFoundError as no_internals_spreadsheet_msg:
         print(f"{no_internals_spreadsheet_msg}. Skipping smart spellcheck...\n"
@@ -481,12 +345,12 @@ def do_batch_verification(mod_path: Path | str) -> bool:
     return all(subdir_results_list)
 
 
-def do_renaming(mod_root_path, mod_slot_int, new_slot_int):
-    fuzzy_slot_specific = mod_path.glob(f'**/*0{mod_slot}*')  # Might latch onto _001.nutexb, which we don't want
-    sorted([fuzzy_slot_specific.parts[-1] for fuzzy_slot_specific in mod_path.glob(f'**/*0{mod_slot}*')])
-    list(mod_path.glob(f'**/*0{mod_slot}*'))[0].relative_to(mod_path)  # Get that human-readable relative path!
-    re.sub(r'(?<!\d)0[0-7](?!\d)', fr'0{new_slot}', glob)  # For renaming 03.bntx or even 03 but not 003
-    pass
+# def do_renaming(mod_root_path, mod_slot_int, new_slot_int):
+#     fuzzy_slot_specific = mod_path.glob(f'**/*0{mod_slot}*')  # Might latch onto _001.nutexb, which we don't want
+#     sorted([fuzzy_slot_specific.parts[-1] for fuzzy_slot_specific in mod_path.glob(f'**/*0{mod_slot}*')])
+#     list(mod_path.glob(f'**/*0{mod_slot}*'))[0].relative_to(mod_path)  # Get that human-readable relative path!
+#     re.sub(r'(?<!\d)0[0-7](?!\d)', fr'0{new_slot}', glob)  # For renaming 03.bntx or even 03 but not 003
+#     pass
 
 
 if __name__ == '__main__':
@@ -505,11 +369,11 @@ if __name__ == '__main__':
         print(f"{mod_name} appears to not be a directory...")
         if mod_path.is_file():
             if mod_path.suffix == '.zip':
-                print(f"You forgot to unzip the mod after downloading?")
+                print("You forgot to unzip the mod after downloading?")
             else:
                 print(f"'{mod_path.suffix}': it's a file; you've pointed me to the wrong thing!")
         else:
-            print(f"This isn't even a file! Please point me to an unzipped mod directory.")
+            print("This isn't even a file! Please point me to an unzipped mod directory.")
         exit()
 
     # Extract source slot number from directory name
@@ -521,9 +385,7 @@ if __name__ == '__main__':
         verification_result = do_verification(mod_path, mod_name_slot)
     else:
         # No slot in mod name, assume user wants batch verification of subdirectories
-        batch_target_subdirs = [sub for sub in mod_path.iterdir() if sub.is_dir()]
-        for subdir in batch_target_subdirs:
-            do_verification(subdir)
+        do_batch_verification(mod_name)
         # i.e. get list of subdirectories and loop Verification until fails, no harm in doing so. Then we're done.
         # Design question: should verification function be responsible for extracting slot? Because
         # batch verification doesn't require slot, yet depends on running a bunch of verification
@@ -533,13 +395,13 @@ if __name__ == '__main__':
     # Verification
     # Suggest human correct before allowing renaming, but give option to override
 
-    # Clean up intended new slot
-    arg_new_slot = sys.argv[2]
-    new_slot = int(arg_new_slot[-1])    # Kind of unhinged way to get slot digit in case it's formatted 'c0X'
-    if new_slot > 7 or new_slot < 0:
-        print(f"{new_slot} is the detected slot number, but it must be between 0 and 7;\n"
-              f"I know additional slots (beyond 8) is now possible in Arcropolis, but I haven't added it yet")
-        exit()
+    # # Clean up intended new slot
+    # arg_new_slot = sys.argv[2]
+    # new_slot = int(arg_new_slot[-1])    # Kind of unhinged way to get slot digit in case it's formatted 'c0X'
+    # if new_slot > 7 or new_slot < 0:
+    #     print(f"{new_slot} is the detected slot number, but it must be between 0 and 7;\n"
+    #           f"I know additional slots (beyond 8) is now possible in Arcropolis, but I haven't added it yet")
+    #     exit()
 
     # Renaming
     # Prep: clean command line input arg and generate new directory name (but prepend WIP: until finished)
