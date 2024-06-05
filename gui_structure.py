@@ -1,4 +1,6 @@
 import tkinter as tk
+from contextlib import redirect_stdout
+import io
 
 
 """
@@ -36,11 +38,11 @@ class Textbox:
         )
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y, expand=False)
         # Make a Text (box) in the Frame, which uses the Frame's Scrollbar (convoluted?)
-        # TODO: Make scrollbar clickable lmao
         self.text = tk.Text(
             master=self.frame,
             yscrollcommand=self.scrollbar.set
         )
+        self.scrollbar.config(command=self.text.yview)  # Needed to make scrollbar clickable!
         self.text.pack(fill=tk.BOTH, expand=True)     # Fills and expands with Frame
 
         # Key bindings for convenience
@@ -120,7 +122,16 @@ if __name__ == '__main__':
 
     # Create visuals in object-oriented manner around root
     app = Application(root, "My Window Title")
-    app.textbox.print("Testing, testing, testing!\n" * 50)  # Fill up textbox to test scrollbar
+    # Test 1: Textbox class print method
+    app.textbox.print("Testing, testing, testing of my Textbox's print method!\n" * 50)  # Fill up textbox to test scrollbar
+    # Test 2: Using contextlib's redirect_stdout with traditional print function
+    def _test_print():
+        print("More testing, this time of contextlib's redirect_stdout!\n" * 25, end='')
+    with redirect_stdout(io.StringIO()) as f:
+        print()     # Explicit newline
+        _test_print()
+    captured_stdout_string = f.getvalue()  # Get the prints as a string
+    app.textbox.print(captured_stdout_string)
     
     # Render with Tkinter event loop which keeps "window" open
     root.mainloop()
