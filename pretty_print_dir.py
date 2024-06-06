@@ -1,4 +1,6 @@
 from pathlib import Path, PurePath
+from gui_structure import Application, tk, redirect_stdout, io
+
 
 def pretty_print_dir(root_path: Path | str) -> None:
     """ Aesthetically print file structure, i.e. recursively show names of sub-directories and files;
@@ -15,7 +17,7 @@ def pretty_print_dir(root_path: Path | str) -> None:
         root_path = Path(root_path)
     if not root_path.is_dir():
         raise ValueError(f"'{root_path.name}': can't pretty-print a non-directory")
-    print(root_path.name)   # Unique starting case that won't be covered during recursion
+    print(root_path.absolute().name)   # Unique starting case that won't be covered during recursion
     _pretty_print_dir_recurse(root_path, level=1)    # Note how level 1 indicates children of root
 
 
@@ -48,7 +50,7 @@ def _pretty_print_non_last_child(general_path: PurePath, level: int) -> None:
     :return: None
     """
     print(' '*4*(level-1), end='')
-    print('|-- ', end='')
+    print('├── ', end='')
     print(general_path.name, end='\n')
 
 
@@ -59,5 +61,20 @@ def _pretty_print_last_child(general_path: PurePath, level: int) -> None:
     :return: None
     """
     print(' '*4*(level-1), end='')
-    print('L__ ', end='')
+    print('└── ', end='')
     print(general_path.name, end='\n')
+
+
+if __name__ == '__main__':
+    # Pretty-print the current directory (to terminal)!
+    pretty_print_dir('.')
+
+    # Also show it in a Tkinter GUI with copy capabilities
+    # NOTE: Due to an inscrutable bug in the GUI library, you must paste before closing the GUI
+    with redirect_stdout(io.StringIO()) as f:
+        pretty_print_dir('.')
+    captured_stdout_string = f.getvalue()  # Get the prints as a string
+    root = tk.Tk()
+    app = Application(root, "Current Directory Pretty-Print!")
+    app.textbox.print(captured_stdout_string)
+    root.mainloop()
