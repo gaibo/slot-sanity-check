@@ -69,10 +69,16 @@ class Textbox:
             return ''
     
     def copy_selection(self) -> None:
+        # NOTE: It is a known issue with Tkinter that copying BUT CLOSING THE WINDOW BEFORE PASTING 
+        #       causes the "copied" content to not actually reach the OS's clipboard. This has been 
+        #       an open issue for literally a decade. I tried using alternative libraries, but 
+        #       they didn't work either.
+        #       So for now, I have no recommendation other than LEAVE THIS GUI WINDOW OPEN 
+        #       WHILE YOU PASTE THE RESULT ELSEWHERE. Otherwise, paste won't work (and may even freeze).
         selected_str = self.get_selection()
         self.master.clipboard_clear()   # Any tk.Misc master should have these methods!
-        self.master.clipboard_append(selected_str)
-        self.master.update()    # Now it stays on clipboard after window is closed
+        self.master.clipboard_append(selected_str)  # pyperclip.copy(selected_str); xerox.copy(selected_str)
+        self.master.update()    # Supposedly helps content reach clipboard before window is closed... not for me
     
     def highlight_all(self) -> None:
         # NOTE: This "highlights" with a color of my choice, but doesn't "select"!
